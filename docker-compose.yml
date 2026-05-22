@@ -50,6 +50,11 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      # Explicit override — Sonnet 4.6 on Bedrock requires an inference-profile ID,
+      # not a raw foundation-model ID. This guarantees a working ID regardless of
+      # what's in .env.
+      BEDROCK_MODEL_ID: us.anthropic.claude-sonnet-4-6
     depends_on:
       postgres:
         condition: service_healthy

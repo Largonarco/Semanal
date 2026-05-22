@@ -63,6 +63,20 @@ def _mock_label(snippets: list[str]) -> dict[str, Any]:
     }
 
 
+def _extract_json_object(text: str) -> dict[str, Any]:
+    """Pull the first balanced { ... } object out of the model output.
+
+    Sonnet 4.6 on Bedrock doesn't accept assistant-message prefill, so we rely
+    on the system prompt instructing JSON-only output and tolerate leading
+    whitespace / minor prose around the object.
+    """
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(f"Bedrock response contained no JSON object: {text[:200]!r}")
+    return json.loads(text[start : end + 1])
+
+
 def _invoke_bedrock_sync(snippets: list[str]) -> dict[str, Any]:
     settings = get_settings()
     client = _make_bedrock_client()
@@ -72,8 +86,6 @@ def _invoke_bedrock_sync(snippets: list[str]) -> dict[str, Any]:
         "system": SYSTEM_PROMPT,
         "messages": [
             {"role": "user", "content": _build_user_prompt(snippets)},
-            # Prefill with `{` so the model continues a JSON object.
-            {"role": "assistant", "content": "{"},
         ],
     }
     response = client.invoke_model(
@@ -82,8 +94,7 @@ def _invoke_bedrock_sync(snippets: list[str]) -> dict[str, Any]:
     )
     payload = json.loads(response["body"].read())
     text = payload["content"][0]["text"]
-    # Reattach the prefilled `{`
-    return json.loads("{" + text)
+    return _extract_json_object(text)
 
 
 async def _fetch_topic_and_snippets(

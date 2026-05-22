@@ -97,7 +97,7 @@ def main() -> None:
     log.info("Loading dataset %s split=%s ...", args.dataset, args.split)
     from datasets import load_dataset
 
-    ds = load_dataset(args.dataset, split=args.split)
+    ds = load_dataset(args.dataset, split=args.split, trust_remote_code=True)
     n = min(args.limit, len(ds))
     log.info("Seeding %d dialogues to %s", n, args.api_url)
 
