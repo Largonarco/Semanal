@@ -32,7 +32,7 @@ GET /conversations/{id}/topics       ◄─────────────�
 GET /clustering-runs/latest/topics   ◄────────────────────────────────────┘
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the full design rationale and [docs/data-flow.md](docs/data-flow.md) for sequence diagrams.
+See [docs/architecture.md](docs/architecture.md) for the one-page system snapshot, [docs/REASONING.md](docs/REASONING.md) for why each component was chosen (and what was rejected), and [docs/data-flow.md](docs/data-flow.md) for sequence diagrams.
 
 ## Quickstart
 
