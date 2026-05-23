@@ -178,18 +178,6 @@ The 0.85 threshold is the only knob. Lower it for more aggressive identity-keepi
 
 ---
 
-## Test scope: unit-only, no integration
-
-**Considered:** unit + integration (testcontainers + Postgres), unit + integration + E2E, unit only.
-
-**Chosen because:** the deterministic logic (emergence formula, centroid matching, schema coercion, chunker offset arithmetic) covers the parts where a bug would silently produce wrong results. The integration paths (DB writes, arq enqueue, Bedrock calls) are exercised by the end-to-end MultiWOZ run, which is reproducible via `docker compose up` + `seed_multiwoz`.
-
-**Rejected:**
-- **Integration suite:** testcontainers + pgvector image + isolated DB per test would add ~2 minutes to CI for marginal additional confidence. Out of scope.
-- **E2E in CI:** would require Bedrock credentials in CI secrets — unwanted attack surface for an assignment.
-
----
-
 ## What's explicitly *not* in the system
 
 - **Sentiment confidence score.** LLMs are bad at calibrated confidence without rubrics. Only the categorical label.
@@ -197,3 +185,119 @@ The 0.85 threshold is the only knob. Lower it for more aggressive identity-keepi
 - **Global "emerging topics" endpoint.** See above — deliberate design call.
 - **mypy / pre-commit / CI.** Assignment-scoped; `ruff` + `pytest` are the lint+test surface.
 - **Frontend.** Backend-only per assignment. OpenAPI at `/docs` is the GUI.
+
+---
+
+## What would you do differently with a month instead of a weekend?
+
+The current build is correct and runnable, but several pieces were taken at the simplest defensible point. Given a month of focused work, the priorities below are roughly ordered by production-readiness impact.
+
+### 1. Replace arq with a battle-tested queue for high-stress workloads
+
+`arq` is async-native and lightweight, which is great for the assignment. At scale it has limits that production needs to push past:
+
+- **Celery + Redis or Celery + RabbitMQ** for richer routing, priority queues, retry-with-backoff policies, distributed task tracing, and a 10+ year-old operational ecosystem (Flower, Prometheus exporters, alerting integrations).
+- **Kafka** as the ingest log if conversations arrive faster than the worker can drain them — durable, replayable, lets us reprocess everything after a chunker config change without losing the source order.
+- **Hybrid:** Kafka as the durable ingest tier, Celery/Redis for the ephemeral worker fan-out behind it. Lets ingestion absorb burst traffic (think: a single Slack connector pushing 100K backfilled messages) without coupling burst load to worker capacity.
+
+Two specific shortcomings of the current arq setup that production needs:
+- No per-task retry policy — a transient Bedrock timeout currently fails the job rather than retrying with exponential backoff.
+- No dead-letter queue — failed labeling jobs sit forever in `jobs` with `status='failed'`; there's no automated recovery loop.
+
+### 2. Per-topic mentions list — actual conversation snippets in the API response
+
+Today, `GET /topics/{id}` returns 5 exemplar snippets across all conversations, and `GET /conversations/{id}/topics` returns 3 snippets per topic. That's enough to verify "the system thinks this is the topic," but not enough to **build user trust**. A PM needs to drill into a topic and read the full set of mentions to decide whether the insight is real.
+
+**Build:**
+- `GET /topics/{id}/mentions?limit=N&offset=M` — paginated list of every chunk in the topic with its source `conversation_id`, the surrounding turns from `data/raw/{conversation_id}.json`, the `mention_at` timestamp, and a permalink to the conversation.
+- `GET /topics/{id}/mentions?conversation_id=X` — filter to a single conversation's mentions for that topic.
+- Inline highlighting: the chunk-level slice the LLM saw, plus 1-2 turns of surrounding context for natural reading.
+- Sort options: chronological, by cluster-membership confidence (HDBSCAN `probabilities_` — currently used only for exemplar selection, but worth persisting on the `chunks` row), by sentiment if we add per-chunk sentiment.
+
+This single feature transforms the system from "a black-box clustering output" into "a debuggable evidence ledger." It's the difference between "trust me" and "look for yourself."
+
+### 3. Better embedding models without proportionally higher cost
+
+BGE-small is the right choice for free + CPU + fast. With budget for one inference GPU:
+
+- **`BAAI/bge-large-en-v1.5`** (1024 dim) — meaningfully better MTEB scores, still self-hosted, ~10x latency on CPU but trivial on a small GPU.
+- **`nomic-embed-text-v1.5`** (768 dim) — context window up to 8K, lets us embed entire short conversations as single chunks where the topic is unambiguous.
+- **`mxbai-embed-large-v1`** — strong MTEB performance, Apache-2.0, often top of leaderboard for English.
+- **`BAAI/bge-m3`** — multilingual + 8K context + multi-granularity (dense + sparse + colbert). Pays for itself the moment a non-English conversation arrives.
+
+Then a structured A/B harness: same MultiWOZ + a held-out customer-support corpus, swap the embedder, score clustering coherence (NPMI / topic-coherence-v measure on the labeled clusters) plus retrieval quality (recall@10 against a curated query set). Codify the winner; never pick by vibes.
+
+Side benefit: a proper offline eval lets us tune `min_cluster_size`, `umap_n_neighbors`, `knn_assign_threshold`, and `centroid_match_threshold` as a Pareto problem instead of by hand.
+
+### 4. Cross-conversation topic deduplication + LLM-driven inter-link synthesis
+
+The current system surfaces topics per conversation, and the global view at `/clustering-runs/latest/topics` is just a flat list. In the 500-dialogue run, we saw two pairs of near-duplicate topics (two "conversation closing" clusters, two "contact info" clusters). HDBSCAN found genuinely distinct sub-clusters, but a PM would (correctly) say "these are the same theme."
+
+**Build a new endpoint:** `POST /topics/synthesize` with body `{conversation_ids: [...]}` (or `?since=...` / `?from_runs=[...]` variants).
+
+Pipeline:
+1. **Gather** the union of topics touched by chunks in the selected conversations.
+2. **Dedup pass:** compute pairwise cosine similarity between topic centroids; cluster topics with cosine ≥ ~0.90 into "topic groups." (Same centroid-matching primitive as run-to-run stability, run on the topic level instead of the cluster level.)
+3. **Inter-link pass:** for any topic groups whose centroids are NOT near-duplicate but whose chunks frequently co-occur in the same conversations (Jaccard on conversation_id sets), send the cluster labels + representative snippets to Sonnet 4.6 with a prompt like: *"Are these N topics facets of one broader theme? If yes, produce one cohesive parent topic name + the relationships between the sub-topics."*
+4. **Output:** a hierarchical tree — parent themes containing the original topic IDs as children, with explicit relationship notes ("X is the cause; Y is the symptom" or "X and Y both manifest as Z"). Each parent gets its own LLM-generated label, sentiment, and PM insight, but the children remain navigable.
+
+This turns the system into a true **insight synthesis** layer rather than a flat topic list. Crucially, the user selects the scope (single team's conversations, a date range, conversations from one connector) so the dedup + inter-link is meaningful in context, not noise-prone like global cross-everything dedup.
+
+### 5. Observability & operational maturity
+
+- **OpenTelemetry tracing** across the request → enqueue → worker → DB → Bedrock chain. Span on each chunker call, each embedding batch, each Bedrock invoke. Trace IDs flow through `jobs.payload` for end-to-end correlation.
+- **Prometheus metrics:** ingest job latency p50/p95/p99, chunks per conversation distribution, k-NN assignment rate, clustering run duration, Bedrock token usage per topic, topic churn (new vs retired) per run.
+- **Structured logging** (JSON, with correlation IDs) instead of the current plain-text logs.
+- **Health endpoints beyond `/healthz`:** `/readyz` (DB + Redis + Bedrock auth all reachable), `/livez` (process alive but maybe degraded).
+- **Worker autoscaling:** scale arq/Celery worker replicas horizontally on queue depth.
+
+### 6. Cluster lifecycle monitoring (Approach D territory)
+
+Today we recluster on a 24h cron or manual trigger. Production needs:
+- **Davies-Bouldin + silhouette scoring** of each clustering pass. If quality drops below a threshold, page someone or auto-trigger a refinement run with adjusted params.
+- **Drift detection:** monitor the rate of `topic_id = NULL` chunks (the k-NN-unassigned bucket). If that climbs above a threshold, current centroids no longer cover the incoming data — auto-trigger a re-clustering.
+- **Targeted re-clustering** instead of full passes: if only one cluster is bloated or drift-detecting, recluster that subspace only, not the entire chunk set. The 2026 research direction in approach D.
+
+### 7. Multi-tenancy + auth
+
+- API keys per organization, scoped to their own `conversations` / `topics` namespace via row-level security.
+- Per-tenant rate limits.
+- Hierarchical topic namespaces (so two tenants' "refund requests" topics don't collide).
+- Audit log of who triggered what (`POST /clustering-runs`, `POST /topics/synthesize`).
+
+### 8. Sentiment trajectory and trend signals
+
+- **Per-chunk sentiment** from a small classifier (DistilBERT-SST2 or similar) — cheap, fast — so we can compute trajectory *within* a conversation (started positive, ended negative).
+- **Topic sentiment drift over time:** a topic that was 80% positive last month and 30% positive this month is its own insight worth surfacing automatically.
+- **`GET /topics/{id}/sentiment-timeline`** — bucketed daily sentiment for the topic across all its mentions.
+
+### 9. Bedrock cost optimization
+
+- **Bedrock batch API** for cluster labeling when re-running over many topics (e.g., after a chunker config change touches everything). Up to 50% cheaper than synchronous InvokeModel.
+- **Label cache** keyed by a hash of the top-N exemplar chunks — if the same exemplars are sent to Bedrock again (often happens when a topic's centroid barely moves), serve the cached label.
+- **Prompt caching** if we ever standardize the system prompt to be reusable across many topic-labeling calls (Anthropic's prompt caching: 90% discount on cached prefix tokens). Restructure to put the long instruction block in the system prompt and the variable snippets at the end.
+
+### 10. Storage & data lifecycle
+
+- **S3 / R2 for `data/raw/`** with the same JSON-per-conversation layout — drop-in swap in `app/services/raw_store.py`.
+- **Postgres → ClickHouse** for analytical queries (topic counts by day, sentiment distributions). Postgres stays the source of truth; CDC into ClickHouse for OLAP.
+- **Hot/cold tier:** active topics in pgvector, retired topics in cheaper storage with a slower query path. A topic retired six months ago doesn't need an HNSW slot.
+- **Conversation TTL / archival** so the operational store stays small while history is preserved.
+
+### 11. Testing rigor
+
+- **Integration tests with `testcontainers-python`** spinning real Postgres + pgvector + Redis per test session.
+- **Golden tests for clustering output:** lock the cluster IDs and labels for a fixed seed dataset; flag any drift in CI.
+- **Property-based tests** (Hypothesis) for the chunker — invariants like "no chunk exceeds 400 tokens" or "every input turn is covered by at least one chunk."
+- **Synthetic load tests:** 100K conversations, 5M chunks, measure ingest p99 + clustering wall-clock + memory ceiling. Set a SLO and gate releases on it.
+- **Bedrock mock with realistic latency / failure injection** for E2E tests in CI without burning real LLM cost.
+
+### 12. Frontend / dashboard
+
+The OpenAPI `/docs` page is great for engineers but not for PMs. A minimal Next.js dashboard with:
+- Topic list view sorted by emergence / mention count / sentiment
+- Click into a topic → mentions list (item 2) → click into a mention → full conversation
+- Inline LLM-generated "investigate this" follow-ups
+- Saved views for recurring queries (e.g., "all negative-sentiment topics with >100 mentions in the last 14 days")
+
+This is where the "PM trust" promise is actually delivered.
