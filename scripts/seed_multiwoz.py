@@ -64,6 +64,7 @@ def _post_conversation(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--api-url", default="http://localhost:8000")
+    parser.add_argument("--start", type=int, default=0, help="Skip the first N dialogues")
     parser.add_argument("--limit", type=int, default=500)
     parser.add_argument(
         "--anchor-date",
@@ -98,13 +99,15 @@ def main() -> None:
     from datasets import load_dataset
 
     ds = load_dataset(args.dataset, split=args.split, trust_remote_code=True)
-    n = min(args.limit, len(ds))
-    log.info("Seeding %d dialogues to %s", n, args.api_url)
+    start_idx = max(0, args.start)
+    end_idx = min(start_idx + args.limit, len(ds))
+    n = end_idx - start_idx
+    log.info("Seeding dialogues [%d:%d] (%d total) to %s", start_idx, end_idx, n, args.api_url)
 
     successes = 0
     failures = 0
     with httpx.Client(base_url=args.api_url, timeout=60.0) as client:
-        for i in range(n):
+        for i in range(start_idx, end_idx):
             example = ds[i]
             turns = _reconstruct_turns(example)
             if not turns:
@@ -124,10 +127,11 @@ def main() -> None:
             else:
                 failures += 1
 
-            if (i + 1) % 50 == 0:
+            done = i - start_idx + 1
+            if done % 50 == 0:
                 log.info(
                     "Progress %d/%d  success=%d  failures=%d",
-                    i + 1,
+                    done,
                     n,
                     successes,
                     failures,
